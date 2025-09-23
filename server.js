@@ -11,7 +11,7 @@ dotenv.config();
 
 const {
   PORT = 8080,
-  API_KEY = "change-me",
+  API_KEY = "supersecret",
   MONGO_URI,
   ALLOWED_ORIGINS = "*",
 } = process.env;
@@ -275,4 +275,5 @@ app.post("/api/cashout", async (req, res) => {
 
 
 app.listen(PORT, () => console.log("listening on :" + PORT));
+
 
