@@ -214,4 +214,65 @@ app.get("/api/leaderboard", async (req, res) => {
   );
 });
 
+// --- Compat: accept flattened payloads at /api/cashout (what the userscript sends) ---
+app.post("/api/cashout", async (req, res) => {
+  try {
+    const b = req.body || {};
+
+    // Accept both flattened & "preview" forms from the userscript
+    const flat = {
+      id: b.id || b.cashoutId || b?.preview?.id,
+      accountId: b.accountId || b?.user?.id || b?.preview?.user?.id,
+      accountName: b.accountName || b?.user?.name || b?.preview?.user?.name,
+      game: (b.game || b?.preview?.game || "mines")?.toLowerCase(),
+      currency: (b.currency || b?.preview?.currency || "").toLowerCase(),
+      payout: Number(b.payout ?? b?.preview?.payout ?? 0),
+      payoutMultiplier: Number(b.payoutMultiplier ?? b?.preview?.payoutMultiplier ?? 0),
+      amount: Number(b.amount ?? b?.preview?.amount ?? 0),
+      amountMultiplier: Number(b.amountMultiplier ?? b?.preview?.amountMultiplier ?? 0),
+      updatedAt: b.updatedAt || b?.preview?.updatedAt || null,
+      rawJson: b,
+    };
+
+    if (!flat.id || !flat.accountId) {
+      return res.status(400).json({ error: "missing id or accountId" });
+    }
+
+    // Upsert account
+    await Account.updateOne(
+      { id: flat.accountId },
+      { $set: { name: flat.accountName ?? null } },
+      { upsert: true }
+    );
+
+    // Upsert cashout
+    await Cashout.updateOne(
+      { id: flat.id },
+      {
+        $setOnInsert: { id: flat.id },
+        $set: {
+          accountId: flat.accountId,
+          game: flat.game,
+          currency: flat.currency,
+          payout: flat.payout,
+          payoutMultiplier: flat.payoutMultiplier,
+          amount: flat.amount,
+          amountMultiplier: flat.amountMultiplier,
+          updatedAt: flat.updatedAt,
+          rawJson: flat.rawJson,
+          capturedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    return res.json({ ok: true, id: flat.id });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "server" });
+  }
+});
+
+
 app.listen(PORT, () => console.log("listening on :" + PORT));
+
