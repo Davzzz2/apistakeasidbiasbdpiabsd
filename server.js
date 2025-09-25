@@ -40,15 +40,22 @@ const AccountSchema = new mongoose.Schema(
 
 const CashoutSchema = new mongoose.Schema(
   {
-    id: { type: String, unique: true, index: true }, // cashout id (preview)
+    id: { type: String, unique: true, index: true },            // cashout id (preview)
     accountId: { type: String, index: true },
     game: String,
     currency: String,
+
+    // amounts in crypto
     payout: Number,
     payoutMultiplier: { type: Number, index: true },
     amount: Number,
     amountMultiplier: Number,
-    updatedAt: String, // preview's updatedAt
+
+    // NEW: amounts in USD (computed client-side)
+    amountUSD: Number,
+    payoutUSD: Number,
+
+    updatedAt: String,                                          // preview's updatedAt
     capturedAt: { type: Date, default: Date.now, index: true },
     rawJson: Object,
   },
@@ -112,12 +119,14 @@ app.post("/api/cashouts", async (req, res) => {
       return res.status(400).json({ error: "missing minesCashout.id or user.id" });
     }
 
+    // Upsert account
     await Account.updateOne(
       { id: user.id },
       { $set: { name: user.name ?? null } },
       { upsert: true }
     );
 
+    // Upsert cashout (now stores USD too)
     await Cashout.updateOne(
       { id: minesCashout.id },
       {
@@ -130,6 +139,11 @@ app.post("/api/cashouts", async (req, res) => {
           payoutMultiplier: Number(minesCashout.payoutMultiplier || 0),
           amount: Number(minesCashout.amount || 0),
           amountMultiplier: Number(minesCashout.amountMultiplier || 0),
+
+          // NEW: persist USD values if provided by the userscript
+          amountUSD: Number(minesCashout.amountUSD ?? 0),
+          payoutUSD: Number(minesCashout.payoutUSD ?? 0),
+
           updatedAt: minesCashout.updatedAt ?? null,
           rawJson: req.body,
           capturedAt: new Date(),
@@ -154,11 +168,14 @@ app.get("/api/accounts", async (_req, res) => {
 // Account summary (top3 + totals)
 app.get("/api/accounts/:id/summary", async (req, res) => {
   const id = req.params.id;
+
+  // top 3 by multiplier
   const top3 = await Cashout.find({ accountId: id })
     .sort({ payoutMultiplier: -1 })
     .limit(3)
     .lean();
 
+  // totals in crypto and USD (USD sums will be 0 if client didn't send USD)
   const [totals] = await Cashout.aggregate([
     { $match: { accountId: id } },
     {
@@ -167,11 +184,22 @@ app.get("/api/accounts/:id/summary", async (req, res) => {
         totalBets: { $sum: 1 },
         maxMult: { $max: "$payoutMultiplier" },
         totalPayout: { $sum: "$payout" },
+        totalPayoutUSD: { $sum: "$payoutUSD" },
+        totalAmountUSD: { $sum: "$amountUSD" },
       },
     },
   ]);
 
-  return res.json({ top3, totals: totals || { totalBets: 0, maxMult: 0, totalPayout: 0 } });
+  return res.json({
+    top3,
+    totals: totals || {
+      totalBets: 0,
+      maxMult: 0,
+      totalPayout: 0,
+      totalPayoutUSD: 0,
+      totalAmountUSD: 0,
+    },
+  });
 });
 
 // Paginated cashouts
@@ -214,12 +242,12 @@ app.get("/api/leaderboard", async (req, res) => {
   );
 });
 
-// --- Compat: accept flattened payloads at /api/cashout (what the userscript sends) ---
+// --- Compat: accept flattened payloads at /api/cashout (what the userscript may send) ---
 app.post("/api/cashout", async (req, res) => {
   try {
     const b = req.body || {};
 
-    // Accept both flattened & "preview" forms from the userscript
+    // Accept both flattened & "preview" forms
     const flat = {
       id: b.id || b.cashoutId || b?.preview?.id,
       accountId: b.accountId || b?.user?.id || b?.preview?.user?.id,
@@ -230,6 +258,11 @@ app.post("/api/cashout", async (req, res) => {
       payoutMultiplier: Number(b.payoutMultiplier ?? b?.preview?.payoutMultiplier ?? 0),
       amount: Number(b.amount ?? b?.preview?.amount ?? 0),
       amountMultiplier: Number(b.amountMultiplier ?? b?.preview?.amountMultiplier ?? 0),
+
+      // NEW: USD fields
+      amountUSD: Number(b.amountUSD ?? b?.preview?.amountUSD ?? 0),
+      payoutUSD: Number(b.payoutUSD ?? b?.preview?.payoutUSD ?? 0),
+
       updatedAt: b.updatedAt || b?.preview?.updatedAt || null,
       rawJson: b,
     };
@@ -258,6 +291,11 @@ app.post("/api/cashout", async (req, res) => {
           payoutMultiplier: flat.payoutMultiplier,
           amount: flat.amount,
           amountMultiplier: flat.amountMultiplier,
+
+          // USD persisted here too
+          amountUSD: flat.amountUSD,
+          payoutUSD: flat.payoutUSD,
+
           updatedAt: flat.updatedAt,
           rawJson: flat.rawJson,
           capturedAt: new Date(),
@@ -273,7 +311,4 @@ app.post("/api/cashout", async (req, res) => {
   }
 });
 
-
 app.listen(PORT, () => console.log("listening on :" + PORT));
-
-
