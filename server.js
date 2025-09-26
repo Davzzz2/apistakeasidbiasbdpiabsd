@@ -22,9 +22,7 @@ if (!MONGO_URI) {
 }
 
 // --- Mongo ---
-await mongoose.connect(MONGO_URI, {
-  dbName: "staketracker",
-});
+await mongoose.connect(MONGO_URI, { dbName: "staketracker" });
 mongoose.connection.on("connected", () =>
   console.log("Mongo connected:", mongoose.connection.name)
 );
@@ -40,22 +38,22 @@ const AccountSchema = new mongoose.Schema(
 
 const CashoutSchema = new mongoose.Schema(
   {
-    id: { type: String, unique: true, index: true },            // cashout id (preview)
+    id: { type: String, unique: true, index: true }, // cashout id (preview)
     accountId: { type: String, index: true },
     game: String,
     currency: String,
 
-    // amounts in crypto
+    // crypto amounts
     payout: Number,
     payoutMultiplier: { type: Number, index: true },
     amount: Number,
     amountMultiplier: Number,
 
-    // NEW: amounts in USD (computed client-side)
+    // USD amounts (optional; client or server can populate)
     amountUSD: Number,
     payoutUSD: Number,
 
-    updatedAt: String,                                          // preview's updatedAt
+    updatedAt: String,
     capturedAt: { type: Date, default: Date.now, index: true },
     rawJson: Object,
   },
@@ -70,6 +68,10 @@ const Cashout = mongoose.model("Cashout", CashoutSchema);
 
 // --- App ---
 const app = express();
+
+// IMPORTANT: behind Render/Cloudflare proxy
+// 1 means "trust first proxy"; use `true` to trust all if you prefer.
+app.set("trust proxy", 1);
 
 // Security & perf
 app.use(helmet());
@@ -95,6 +97,8 @@ app.use(
     max: 120,
     standardHeaders: true,
     legacyHeaders: false,
+    // Optional explicit key (uses req.ip which respects trust proxy now)
+    keyGenerator: (req) => req.ip,
   })
 );
 
@@ -109,7 +113,68 @@ app.use("/api", (req, res, next) => {
   return res.status(401).json({ error: "Unauthorized" });
 });
 
-// --- Routes ---
+// ---------------- USD helper (server-side backfill) ----------------
+const COINGECKO_IDS = {
+  ltc: "litecoin",
+  btc: "bitcoin",
+  eth: "ethereum",
+  doge: "dogecoin",
+  bch: "bitcoin-cash",
+  xrp: "ripple",
+  usdt: "tether",
+  usdc: "usd-coin",
+};
+
+const priceCache = new Map(); // key = 'ltc', value = { usd, ts }
+const PRICE_TTL_MS = 60_000;
+
+async function getUsdRate(symLower) {
+  try {
+    const key = String(symLower || "").toLowerCase();
+    const id = COINGECKO_IDS[key];
+    if (!id) return null;
+
+    const now = Date.now();
+    const cached = priceCache.get(key);
+    if (cached && now - cached.ts < PRICE_TTL_MS) return cached.usd;
+
+    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(
+      id
+    )}&vs_currencies=usd`;
+    const r = await fetch(url, { headers: { "accept": "application/json" } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const usd = (j && j[id] && typeof j[id].usd === "number") ? j[id].usd : null;
+    if (typeof usd === "number") {
+      priceCache.set(key, { usd, ts: now });
+      return usd;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function attachUsdIfMissing(doc) {
+  // Leaves existing USD fields intact; fills them if absent
+  if (!doc) return doc;
+  if (typeof doc.amountUSD === "number" && typeof doc.payoutUSD === "number") {
+    return doc;
+  }
+  const rate = await getUsdRate(doc.currency);
+  if (typeof rate === "number") {
+    if (typeof doc.amountUSD !== "number")
+      doc.amountUSD = Number(doc.amount || 0) * rate;
+    if (typeof doc.payoutUSD !== "number")
+      doc.payoutUSD = Number(doc.payout || 0) * rate;
+  } else {
+    if (typeof doc.amountUSD !== "number") doc.amountUSD = 0;
+    if (typeof doc.payoutUSD !== "number") doc.payoutUSD = 0;
+  }
+  return doc;
+}
+
+// ---------------- Routes ----------------
 
 // Ingest a cashout payload: { minesCashout, user }
 app.post("/api/cashouts", async (req, res) => {
@@ -119,14 +184,12 @@ app.post("/api/cashouts", async (req, res) => {
       return res.status(400).json({ error: "missing minesCashout.id or user.id" });
     }
 
-    // Upsert account
     await Account.updateOne(
       { id: user.id },
       { $set: { name: user.name ?? null } },
       { upsert: true }
     );
 
-    // Upsert cashout (now stores USD too)
     await Cashout.updateOne(
       { id: minesCashout.id },
       {
@@ -140,7 +203,7 @@ app.post("/api/cashouts", async (req, res) => {
           amount: Number(minesCashout.amount || 0),
           amountMultiplier: Number(minesCashout.amountMultiplier || 0),
 
-          // NEW: persist USD values if provided by the userscript
+          // USD fields from client (if provided)
           amountUSD: Number(minesCashout.amountUSD ?? 0),
           payoutUSD: Number(minesCashout.payoutUSD ?? 0),
 
@@ -165,18 +228,23 @@ app.get("/api/accounts", async (_req, res) => {
   return res.json(accounts);
 });
 
-// Account summary (top3 + totals)
+// Account summary (top3 + totals) with USD backfill
 app.get("/api/accounts/:id/summary", async (req, res) => {
   const id = req.params.id;
 
-  // top 3 by multiplier
-  const top3 = await Cashout.find({ accountId: id })
+  // Get top3 by multiplier
+  let top3 = await Cashout.find({ accountId: id })
     .sort({ payoutMultiplier: -1 })
     .limit(3)
     .lean();
 
-  // totals in crypto and USD (USD sums will be 0 if client didn't send USD)
-  const [totals] = await Cashout.aggregate([
+  // Backfill USD in the returned docs if missing
+  await Promise.all(top3.map(async (doc, i) => {
+    top3[i] = await attachUsdIfMissing(doc);
+  }));
+
+  // Totals (crypto + USD)
+  const [totalsRaw] = await Cashout.aggregate([
     { $match: { accountId: id } },
     {
       $group: {
@@ -190,16 +258,44 @@ app.get("/api/accounts/:id/summary", async (req, res) => {
     },
   ]);
 
-  return res.json({
-    top3,
-    totals: totals || {
-      totalBets: 0,
-      maxMult: 0,
-      totalPayout: 0,
-      totalPayoutUSD: 0,
-      totalAmountUSD: 0,
-    },
-  });
+  // If DB lacks USD in old rows, totals might be low — do a cheap backfill estimate
+  let totals = totalsRaw || {
+    totalBets: 0,
+    maxMult: 0,
+    totalPayout: 0,
+    totalPayoutUSD: 0,
+    totalAmountUSD: 0,
+  };
+
+  if (!totalsRaw || totals.totalPayoutUSD === 0 || totals.totalAmountUSD === 0) {
+    // Try to estimate totalsUSD from the most recent rate
+    const latest = await Cashout.findOne({ accountId: id })
+      .sort({ capturedAt: -1 })
+      .lean();
+    if (latest?.currency) {
+      const r = await getUsdRate(latest.currency);
+      if (typeof r === "number") {
+        if (!totalsRaw || totals.totalAmountUSD === 0) {
+          const sumAmt = await Cashout.aggregate([
+            { $match: { accountId: id } },
+            { $group: { _id: null, s: { $sum: "$amount" } } },
+          ]);
+          const sAmt = (sumAmt[0]?.s ?? 0) * r;
+          totals.totalAmountUSD = Math.round(sAmt * 100) / 100;
+        }
+        if (!totalsRaw || totals.totalPayoutUSD === 0) {
+          const sumPay = await Cashout.aggregate([
+            { $match: { accountId: id } },
+            { $group: { _id: null, s: { $sum: "$payout" } } },
+          ]);
+          const sPay = (sumPay[0]?.s ?? 0) * r;
+          totals.totalPayoutUSD = Math.round(sPay * 100) / 100;
+        }
+      }
+    }
+  }
+
+  return res.json({ top3, totals });
 });
 
 // Paginated cashouts
@@ -229,7 +325,6 @@ app.get("/api/leaderboard", async (req, res) => {
     .limit(size)
     .lean();
 
-  // attach names
   const ids = [...new Set(rows.map((r) => r.accountId))];
   const accs = await Account.find({ id: { $in: ids } }).lean();
   const nameById = Object.fromEntries(accs.map((a) => [a.id, a.name || a.id]));
@@ -242,12 +337,11 @@ app.get("/api/leaderboard", async (req, res) => {
   );
 });
 
-// --- Compat: accept flattened payloads at /api/cashout (what the userscript may send) ---
+// Compat: flattened payloads
 app.post("/api/cashout", async (req, res) => {
   try {
     const b = req.body || {};
 
-    // Accept both flattened & "preview" forms
     const flat = {
       id: b.id || b.cashoutId || b?.preview?.id,
       accountId: b.accountId || b?.user?.id || b?.preview?.user?.id,
@@ -259,7 +353,6 @@ app.post("/api/cashout", async (req, res) => {
       amount: Number(b.amount ?? b?.preview?.amount ?? 0),
       amountMultiplier: Number(b.amountMultiplier ?? b?.preview?.amountMultiplier ?? 0),
 
-      // NEW: USD fields
       amountUSD: Number(b.amountUSD ?? b?.preview?.amountUSD ?? 0),
       payoutUSD: Number(b.payoutUSD ?? b?.preview?.payoutUSD ?? 0),
 
@@ -271,14 +364,12 @@ app.post("/api/cashout", async (req, res) => {
       return res.status(400).json({ error: "missing id or accountId" });
     }
 
-    // Upsert account
     await Account.updateOne(
       { id: flat.accountId },
       { $set: { name: flat.accountName ?? null } },
       { upsert: true }
     );
 
-    // Upsert cashout
     await Cashout.updateOne(
       { id: flat.id },
       {
@@ -291,11 +382,8 @@ app.post("/api/cashout", async (req, res) => {
           payoutMultiplier: flat.payoutMultiplier,
           amount: flat.amount,
           amountMultiplier: flat.amountMultiplier,
-
-          // USD persisted here too
           amountUSD: flat.amountUSD,
           payoutUSD: flat.payoutUSD,
-
           updatedAt: flat.updatedAt,
           rawJson: flat.rawJson,
           capturedAt: new Date(),
