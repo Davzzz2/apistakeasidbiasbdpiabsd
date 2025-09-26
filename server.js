@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import mongoose from "mongoose";
 import helmet from "helmet";
@@ -14,6 +15,8 @@ const {
   API_KEY = "supersecret",
   MONGO_URI,
   ALLOWED_ORIGINS = "*",
+  COINGECKO_BASE = "https://api.coingecko.com/api/v3",
+  PRICE_TTL_MS = "60000", // 60s default
 } = process.env;
 
 if (!MONGO_URI) {
@@ -21,25 +24,43 @@ if (!MONGO_URI) {
   process.exit(1);
 }
 
-// --- Schemas ---
+// -----------------------------
+// Mongo
+// -----------------------------
+await mongoose.connect(MONGO_URI, { dbName: "staketracker" });
+mongoose.connection.on("connected", () =>
+  console.log("Mongo connected:", mongoose.connection.name)
+);
+
+// -----------------------------
+// Schemas / Models
+// -----------------------------
 const AccountSchema = new mongoose.Schema(
-  { id: { type: String, unique: true, index: true }, name: String },
+  {
+    id: { type: String, unique: true, index: true }, // Stake user id
+    name: String,
+  },
   { timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" } }
 );
 
 const CashoutSchema = new mongoose.Schema(
   {
-    id: { type: String, unique: true, index: true },
+    id: { type: String, unique: true, index: true }, // cashout id
     accountId: { type: String, index: true },
     game: String,
-    currency: String,
-    payout: Number,
-    payoutMultiplier: { type: Number, index: true },
-    amount: Number,
+
+    // originals in crypto (as sent by Stake preview)
+    currency: String, // e.g. 'ltc'
+    amount: Number, // CRYPTO amount
+    payout: Number, // CRYPTO payout
     amountMultiplier: Number,
+    payoutMultiplier: { type: Number, index: true },
+
+    // optional USD values (preferred if present)
     amountUSD: Number,
     payoutUSD: Number,
-    updatedAt: String,
+
+    updatedAt: String,         // preview's updatedAt (string)
     capturedAt: { type: Date, default: Date.now, index: true },
     rawJson: Object,
   },
@@ -52,324 +73,364 @@ CashoutSchema.index({ capturedAt: -1 });
 const Account = mongoose.model("Account", AccountSchema);
 const Cashout = mongoose.model("Cashout", CashoutSchema);
 
-// --- USD helpers (summary only) ---
+// -----------------------------
+// Helpers: pricing (CoinGecko)
+// -----------------------------
 const COINGECKO_IDS = {
-  ltc: "litecoin", btc: "bitcoin", eth: "ethereum", doge: "dogecoin",
-  bch: "bitcoin-cash", xrp: "ripple", usdt: "tether", usdc: "usd-coin",
+  ltc: "litecoin",
+  btc: "bitcoin",
+  eth: "ethereum",
+  doge: "dogecoin",
+  bch: "bitcoin-cash",
+  xrp: "ripple",
+  usdt: "tether",
+  usdc: "usd-coin",
 };
-const priceCache = new Map();
-const PRICE_TTL_MS = 60_000;
 
-async function getUsdRate(symLower) {
+const priceCache = new Map(); // key: symbol (lower), val: { price, ts }
+
+async function getUsdRate(symbol) {
+  if (!symbol) return null;
+  const sym = String(symbol).toLowerCase();
+  const id = COINGECKO_IDS[sym];
+  if (!id) return null;
+
+  const ttl = Number(PRICE_TTL_MS) || 60000;
+  const now = Date.now();
+  const cached = priceCache.get(sym);
+  if (cached && now - cached.ts < ttl) return cached.price;
+
   try {
-    const key = String(symLower || "").toLowerCase();
-    const id = COINGECKO_IDS[key];
-    if (!id) return null;
-
-    const now = Date.now();
-    const cached = priceCache.get(key);
-    if (cached && now - cached.ts < PRICE_TTL_MS) return cached.usd;
-
-    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd`;
-    const r = await fetch(url, { headers: { accept: "application/json" } });
-    if (!r.ok) return null;
-    const j = await r.json();
-    const usd = j?.[id]?.usd;
-    if (typeof usd === "number") {
-      priceCache.set(key, { usd, ts: now });
-      return usd;
+    const url = `${COINGECKO_BASE}/simple/price?ids=${encodeURIComponent(
+      id
+    )}&vs_currencies=usd`;
+    const resp = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (!resp.ok) throw new Error(`coingecko ${resp.status}`);
+    const data = await resp.json();
+    const price = data?.[id]?.usd;
+    if (typeof price === "number") {
+      priceCache.set(sym, { price, ts: now });
+      return price;
     }
-    return null;
-  } catch {
-    return null;
+  } catch (e) {
+    console.warn("[price] fetch failed:", e.message);
   }
+  return null;
 }
 
-async function attachUsdIfMissing(doc) {
+// Normalize a single cashout document for RESPONSE:
+// - Preserve originals as amountCrypto/payoutCrypto
+// - Put USD into .amount / .payout (what the frontend expects)
+async function normalizeCashoutToUSD(doc) {
   if (!doc) return doc;
-  if (typeof doc.amountUSD === "number" && typeof doc.payoutUSD === "number") return doc;
-  const rate = await getUsdRate(doc.currency);
-  if (typeof rate === "number") {
-    if (typeof doc.amountUSD !== "number") doc.amountUSD = Number(doc.amount || 0) * rate;
-    if (typeof doc.payoutUSD !== "number") doc.payoutUSD = Number(doc.payout || 0) * rate;
-  } else {
-    if (typeof doc.amountUSD !== "number") doc.amountUSD = 0;
-    if (typeof doc.payoutUSD !== "number") doc.payoutUSD = 0;
+  const out = { ...doc };
+
+  out.amountCrypto = Number(out.amount || 0);
+  out.payoutCrypto = Number(out.payout || 0);
+
+  let amountUSD =
+    typeof out.amountUSD === "number" ? out.amountUSD : undefined;
+  let payoutUSD =
+    typeof out.payoutUSD === "number" ? out.payoutUSD : undefined;
+
+  if (amountUSD === undefined || payoutUSD === undefined) {
+    const r = await getUsdRate(out.currency);
+    if (typeof r === "number") {
+      if (amountUSD === undefined) amountUSD = out.amountCrypto * r;
+      if (payoutUSD === undefined) payoutUSD = out.payoutCrypto * r;
+    } else {
+      amountUSD ??= 0;
+      payoutUSD ??= 0;
+    }
   }
-  return doc;
+
+  out.amount = amountUSD; // USD in the fields the frontend reads
+  out.payout = payoutUSD; // USD in the fields the frontend reads
+
+  return out;
 }
 
-function buildApp() {
-  const app = express();
+// -----------------------------
+// App
+// -----------------------------
+const app = express();
 
-  // trust proxy BEFORE rate limit
-  app.set("trust proxy", 1);
+// Let Express respect X-Forwarded-* (Render/Heroku/CF/CDN)
+// Also silences express-rate-limit trust proxy warning.
+app.set("trust proxy", true);
 
-  // security/perf
-  app.use(helmet());
-  app.use(compression());
-  app.use(
-    cors({
-      origin: (origin, cb) => {
-        if (!origin || ALLOWED_ORIGINS === "*") return cb(null, true);
-        const allowed = ALLOWED_ORIGINS.split(",").map((s) => s.trim());
-        return cb(null, allowed.includes(origin));
-      },
-      credentials: false,
-    })
-  );
-  app.use(express.json({ limit: "1mb" }));
-  app.use(morgan("tiny"));
+// Security & perf
+app.use(helmet());
+app.use(compression());
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin || ALLOWED_ORIGINS === "*") return cb(null, true);
+      const allowed = ALLOWED_ORIGINS.split(",").map((s) => s.trim());
+      return cb(null, allowed.includes(origin));
+    },
+    credentials: false,
+  })
+);
+app.use(express.json({ limit: "1mb" }));
+app.use(morgan("tiny"));
 
-  // rate limit
-  app.use(
-    "/api/",
-    rateLimit({
-      windowMs: 60 * 1000,
-      max: 120,
-      standardHeaders: true,
-      legacyHeaders: false,
-      keyGenerator: (req) => req.ip, // now respects trust proxy
-    })
-  );
+// Rate limiting (120 req / 60s per IP)
+app.use(
+  "/api/",
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req, _res) => req.ip || "global",
+    skipFailedRequests: false,
+    skipSuccessfulRequests: false,
+  })
+);
 
-  // health
-  app.get("/", (_req, res) => res.json({ ok: true, service: "stake-tracker-api" }));
-  app.get("/health", (_req, res) => res.json({ ok: true }));
+// Health + root
+app.get("/", (_req, res) => res.json({ ok: true, service: "stake-tracker-api" }));
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-  // auth
-  app.use("/api", (req, res, next) => {
-    const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-    if (token === API_KEY) return next();
-    return res.status(401).json({ error: "Unauthorized" });
-  });
+// API key guard
+app.use("/api", (req, res, next) => {
+  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (token === API_KEY) return next();
+  return res.status(401).json({ error: "Unauthorized" });
+});
 
-  // POST /api/cashouts (from userscript)
-  app.post("/api/cashouts", async (req, res) => {
-    try {
-      const { minesCashout, user } = req.body || {};
-      if (!minesCashout?.id || !user?.id) {
-        return res.status(400).json({ error: "missing minesCashout.id or user.id" });
-      }
-      await Account.updateOne(
-        { id: user.id },
-        { $set: { name: user.name ?? null } },
-        { upsert: true }
-      );
+// -----------------------------
+// Routes
+// -----------------------------
 
-      await Cashout.updateOne(
-        { id: minesCashout.id },
-        {
-          $setOnInsert: { id: minesCashout.id },
-          $set: {
-            accountId: user.id,
-            game: minesCashout.game?.toLowerCase() ?? null,
-            currency: minesCashout.currency?.toLowerCase() ?? null,
-            payout: Number(minesCashout.payout || 0),
-            payoutMultiplier: Number(minesCashout.payoutMultiplier || 0),
-            amount: Number(minesCashout.amount || 0),
-            amountMultiplier: Number(minesCashout.amountMultiplier || 0),
-            amountUSD: Number(minesCashout.amountUSD ?? 0),
-            payoutUSD: Number(minesCashout.payoutUSD ?? 0),
-            updatedAt: minesCashout.updatedAt ?? null,
-            rawJson: req.body,
-            capturedAt: new Date(),
-          },
-        },
-        { upsert: true }
-      );
-
-      return res.json({ ok: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "server" });
+// Ingest (preferred): { minesCashout, user }
+// If userscript sent amountUSD/payoutUSD, we persist them.
+// If not provided, they'll be backfilled on read via CoinGecko.
+app.post("/api/cashouts", async (req, res) => {
+  try {
+    const { minesCashout, user } = req.body || {};
+    if (!minesCashout?.id || !user?.id) {
+      return res.status(400).json({ error: "missing minesCashout.id or user.id" });
     }
-  });
 
-  // GET accounts
-  app.get("/api/accounts", async (_req, res) => {
-    const accounts = await Account.find().sort({ createdAt: -1 }).lean();
-    return res.json(accounts);
-  });
+    // Upsert account
+    await Account.updateOne(
+      { id: user.id },
+      { $set: { name: user.name ?? null } },
+      { upsert: true }
+    );
 
-  // GET account summary with USD backfill
-  app.get("/api/accounts/:id/summary", async (req, res) => {
-    const id = req.params.id;
-
-    let top3 = await Cashout.find({ accountId: id })
-      .sort({ payoutMultiplier: -1 })
-      .limit(3)
-      .lean();
-
-    await Promise.all(top3.map(async (doc, i) => {
-      top3[i] = await attachUsdIfMissing(doc);
-    }));
-
-    const [totalsRaw] = await Cashout.aggregate([
-      { $match: { accountId: id } },
+    // Upsert cashout
+    await Cashout.updateOne(
+      { id: minesCashout.id },
       {
-        $group: {
-          _id: null,
-          totalBets: { $sum: 1 },
-          maxMult: { $max: "$payoutMultiplier" },
-          totalPayout: { $sum: "$payout" },
-          totalPayoutUSD: { $sum: "$payoutUSD" },
-          totalAmountUSD: { $sum: "$amountUSD" },
+        $setOnInsert: { id: minesCashout.id },
+        $set: {
+          accountId: user.id,
+          game: minesCashout.game?.toLowerCase() ?? null,
+          currency: minesCashout.currency?.toLowerCase() ?? null,
+
+          // store crypto
+          payout: Number(minesCashout.payout || 0),
+          amount: Number(minesCashout.amount || 0),
+          payoutMultiplier: Number(minesCashout.payoutMultiplier || 0),
+          amountMultiplier: Number(minesCashout.amountMultiplier || 0),
+
+          // optional USD from client
+          payoutUSD:
+            typeof minesCashout.payoutUSD === "number"
+              ? minesCashout.payoutUSD
+              : undefined,
+          amountUSD:
+            typeof minesCashout.amountUSD === "number"
+              ? minesCashout.amountUSD
+              : undefined,
+
+          updatedAt: minesCashout.updatedAt ?? null,
+          rawJson: req.body,
+          capturedAt: new Date(),
         },
       },
-    ]);
+      { upsert: true }
+    );
 
-    let totals = totalsRaw || {
-      totalBets: 0,
-      maxMult: 0,
-      totalPayout: 0,
-      totalPayoutUSD: 0,
-      totalAmountUSD: 0,
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "server" });
+  }
+});
+
+// Compat: flattened payloads at /api/cashout
+app.post("/api/cashout", async (req, res) => {
+  try {
+    const b = req.body || {};
+
+    const flat = {
+      id: b.id || b.cashoutId || b?.preview?.id,
+      accountId: b.accountId || b?.user?.id || b?.preview?.user?.id,
+      accountName: b.accountName || b?.user?.name || b?.preview?.user?.name,
+      game: (b.game || b?.preview?.game || "mines")?.toLowerCase(),
+      currency: (b.currency || b?.preview?.currency || "").toLowerCase(),
+
+      payout: Number(b.payout ?? b?.preview?.payout ?? 0), // crypto
+      payoutMultiplier: Number(b.payoutMultiplier ?? b?.preview?.payoutMultiplier ?? 0),
+      amount: Number(b.amount ?? b?.preview?.amount ?? 0), // crypto
+      amountMultiplier: Number(b.amountMultiplier ?? b?.preview?.amountMultiplier ?? 0),
+      updatedAt: b.updatedAt || b?.preview?.updatedAt || null,
+
+      // accept client-provided USD if present
+      payoutUSD: typeof b.payoutUSD === "number" ? b.payoutUSD : undefined,
+      amountUSD: typeof b.amountUSD === "number" ? b.amountUSD : undefined,
+
+      rawJson: b,
     };
 
-    if (!totalsRaw || totals.totalPayoutUSD === 0 || totals.totalAmountUSD === 0) {
-      const latest = await Cashout.findOne({ accountId: id }).sort({ capturedAt: -1 }).lean();
-      if (latest?.currency) {
-        const r = await getUsdRate(latest.currency);
-        if (typeof r === "number") {
-          if (!totalsRaw || totals.totalAmountUSD === 0) {
-            const sumAmt = await Cashout.aggregate([
-              { $match: { accountId: id } },
-              { $group: { _id: null, s: { $sum: "$amount" } } },
-            ]);
-            totals.totalAmountUSD = Math.round(((sumAmt[0]?.s ?? 0) * r) * 100) / 100;
-          }
-          if (!totalsRaw || totals.totalPayoutUSD === 0) {
-            const sumPay = await Cashout.aggregate([
-              { $match: { accountId: id } },
-              { $group: { _id: null, s: { $sum: "$payout" } } },
-            ]);
-            totals.totalPayoutUSD = Math.round(((sumPay[0]?.s ?? 0) * r) * 100) / 100;
-          }
-        }
-      }
+    if (!flat.id || !flat.accountId) {
+      return res.status(400).json({ error: "missing id or accountId" });
     }
 
-    return res.json({ top3, totals });
-  });
+    await Account.updateOne(
+      { id: flat.accountId },
+      { $set: { name: flat.accountName ?? null } },
+      { upsert: true }
+    );
 
-  // GET cashouts (paged)
-  app.get("/api/accounts/:id/cashouts", async (req, res) => {
-    const id = req.params.id;
-    const page = Math.max(1, parseInt(req.query.page ?? "1", 10));
-    const size = Math.min(200, Math.max(1, parseInt(req.query.size ?? "50", 10)));
-    const skip = (page - 1) * size;
-
-    const [rows, total] = await Promise.all([
-      Cashout.find({ accountId: id }).sort({ capturedAt: -1 }).skip(skip).limit(size).lean(),
-      Cashout.countDocuments({ accountId: id }),
-    ]);
-
-    return res.json({ page, size, total, rows });
-  });
-
-  // GET leaderboard
-  app.get("/api/leaderboard", async (req, res) => {
-    const size = Math.min(50, Math.max(1, parseInt(req.query.size ?? "10", 10)));
-    const rows = await Cashout.find({ payoutMultiplier: { $gt: 0 } })
-      .sort({ payoutMultiplier: -1 }).limit(size).lean();
-
-    const ids = [...new Set(rows.map((r) => r.accountId))];
-    const accs = await Account.find({ id: { $in: ids } }).lean();
-    const nameById = Object.fromEntries(accs.map((a) => [a.id, a.name || a.id]));
-
-    return res.json(rows.map((r) => ({ ...r, accountName: nameById[r.accountId] ?? r.accountId })));
-  });
-
-  // Compat: flattened payloads
-  app.post("/api/cashout", async (req, res) => {
-    try {
-      const b = req.body || {};
-      const flat = {
-        id: b.id || b.cashoutId || b?.preview?.id,
-        accountId: b.accountId || b?.user?.id || b?.preview?.user?.id,
-        accountName: b.accountName || b?.user?.name || b?.preview?.user?.name,
-        game: (b.game || b?.preview?.game || "mines")?.toLowerCase(),
-        currency: (b.currency || b?.preview?.currency || "").toLowerCase(),
-        payout: Number(b.payout ?? b?.preview?.payout ?? 0),
-        payoutMultiplier: Number(b.payoutMultiplier ?? b?.preview?.payoutMultiplier ?? 0),
-        amount: Number(b.amount ?? b?.preview?.amount ?? 0),
-        amountMultiplier: Number(b.amountMultiplier ?? b?.preview?.amountMultiplier ?? 0),
-        amountUSD: Number(b.amountUSD ?? b?.preview?.amountUSD ?? 0),
-        payoutUSD: Number(b.payoutUSD ?? b?.preview?.payoutUSD ?? 0),
-        updatedAt: b.updatedAt || b?.preview?.updatedAt || null,
-        rawJson: b,
-      };
-      if (!flat.id || !flat.accountId) {
-        return res.status(400).json({ error: "missing id or accountId" });
-      }
-
-      await Account.updateOne(
-        { id: flat.accountId },
-        { $set: { name: flat.accountName ?? null } },
-        { upsert: true }
-      );
-
-      await Cashout.updateOne(
-        { id: flat.id },
-        {
-          $setOnInsert: { id: flat.id },
-          $set: {
-            accountId: flat.accountId,
-            game: flat.game,
-            currency: flat.currency,
-            payout: flat.payout,
-            payoutMultiplier: flat.payoutMultiplier,
-            amount: flat.amount,
-            amountMultiplier: flat.amountMultiplier,
-            amountUSD: flat.amountUSD,
-            payoutUSD: flat.payoutUSD,
-            updatedAt: flat.updatedAt,
-            rawJson: flat.rawJson,
-            capturedAt: new Date(),
-          },
+    await Cashout.updateOne(
+      { id: flat.id },
+      {
+        $setOnInsert: { id: flat.id },
+        $set: {
+          accountId: flat.accountId,
+          game: flat.game,
+          currency: flat.currency,
+          payout: flat.payout, // crypto
+          payoutMultiplier: flat.payoutMultiplier,
+          amount: flat.amount, // crypto
+          amountMultiplier: flat.amountMultiplier,
+          updatedAt: flat.updatedAt,
+          payoutUSD: flat.payoutUSD,
+          amountUSD: flat.amountUSD,
+          rawJson: flat.rawJson,
+          capturedAt: new Date(),
         },
-        { upsert: true }
-      );
+      },
+      { upsert: true }
+    );
 
-      return res.json({ ok: true, id: flat.id });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "server" });
-    }
-  });
-
-  // global error guard
-  // (helps return 500 instead of crashing → fewer 502s)
-  // eslint-disable-next-line no-unused-vars
-  app.use((err, _req, res, _next) => {
-    console.error("Unhandled error:", err);
-    res.status(500).json({ error: "server" });
-  });
-
-  return app;
-}
-
-async function start() {
-  try {
-    console.log("Connecting to Mongo…");
-    await mongoose.connect(MONGO_URI, { dbName: "staketracker" });
-    console.log("Mongo connected:", mongoose.connection.name);
-
-    const app = buildApp();
-    app.listen(PORT, () => console.log("listening on :" + PORT));
+    return res.json({ ok: true, id: flat.id });
   } catch (e) {
-    console.error("Fatal boot error:", e);
-    process.exit(1);
+    console.error(e);
+    return res.status(500).json({ error: "server" });
   }
-}
-
-// Good practice: crash guards (reduce silent 502s)
-process.on("unhandledRejection", (reason) => {
-  console.error("unhandledRejection:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("uncaughtException:", err);
 });
 
-start();
+// List accounts
+app.get("/api/accounts", async (_req, res) => {
+  const accounts = await Account.find().sort({ createdAt: -1 }).lean();
+  return res.json(accounts);
+});
+
+// Account summary (top3 + totals) — USD in the fields the frontend expects
+app.get("/api/accounts/:id/summary", async (req, res) => {
+  const id = req.params.id;
+
+  // Top 3 by multiplier
+  let top3 = await Cashout.find({ accountId: id })
+    .sort({ payoutMultiplier: -1 })
+    .limit(3)
+    .lean();
+
+  top3 = await Promise.all(top3.map(normalizeCashoutToUSD));
+
+  // Aggregate totals (prefer stored USD; fallback to rate if missing)
+  const [t] = await Cashout.aggregate([
+    { $match: { accountId: id } },
+    {
+      $group: {
+        _id: null,
+        totalBets: { $sum: 1 },
+        maxMult: { $max: "$payoutMultiplier" },
+        totalPayoutUSD: { $sum: "$payoutUSD" }, // may be NaN if undefined -> $sum treats as 0
+        totalAmountUSD: { $sum: "$amountUSD" },
+        totalPayoutCrypto: { $sum: "$payout" },
+        totalAmountCrypto: { $sum: "$amount" },
+        lastCurrency: { $last: "$currency" },
+      },
+    },
+  ]);
+
+  let totals = {
+    totalBets: t?.totalBets || 0,
+    maxMult: t?.maxMult || 0,
+    totalPayout: t?.totalPayoutUSD || 0, // this key must be USD for the frontend
+    totalAmountUSD: t?.totalAmountUSD || 0,
+  };
+
+  // If USD wasn’t stored, backfill using a live rate
+  if (!t || totals.totalPayout === 0 || totals.totalAmountUSD === 0) {
+    const r = await getUsdRate(t?.lastCurrency || "ltc");
+    if (typeof r === "number") {
+      if (totals.totalAmountUSD === 0)
+        totals.totalAmountUSD = (t?.totalAmountCrypto || 0) * r;
+      if (totals.totalPayout === 0)
+        totals.totalPayout = (t?.totalPayoutCrypto || 0) * r;
+    }
+  }
+
+  // Tidy rounding for display
+  totals.totalPayout = Math.round(totals.totalPayout * 100) / 100;
+  totals.totalAmountUSD = Math.round(totals.totalAmountUSD * 100) / 100;
+
+  return res.json({ top3, totals });
+});
+
+// Paginated cashouts — USD in amount/payout fields
+app.get("/api/accounts/:id/cashouts", async (req, res) => {
+  const id = req.params.id;
+  const page = Math.max(1, parseInt(req.query.page ?? "1", 10));
+  const size = Math.min(200, Math.max(1, parseInt(req.query.size ?? "50", 10)));
+  const skip = (page - 1) * size;
+
+  const [rowsRaw, total] = await Promise.all([
+    Cashout.find({ accountId: id })
+      .sort({ capturedAt: -1 })
+      .skip(skip)
+      .limit(size)
+      .lean(),
+    Cashout.countDocuments({ accountId: id }),
+  ]);
+
+  const rows = await Promise.all(rowsRaw.map(normalizeCashoutToUSD));
+
+  return res.json({ page, size, total, rows });
+});
+
+// Global leaderboard (top multipliers across all accounts)
+app.get("/api/leaderboard", async (req, res) => {
+  const size = Math.min(50, Math.max(1, parseInt(req.query.size ?? "10", 10)));
+  const rowsRaw = await Cashout.find({ payoutMultiplier: { $gt: 0 } })
+    .sort({ payoutMultiplier: -1 })
+    .limit(size)
+    .lean();
+
+  const rows = await Promise.all(rowsRaw.map(normalizeCashoutToUSD));
+
+  // attach names
+  const ids = [...new Set(rows.map((r) => r.accountId))];
+  const accs = await Account.find({ id: { $in: ids } }).lean();
+  const nameById = Object.fromEntries(accs.map((a) => [a.id, a.name || a.id]));
+
+  return res.json(
+    rows.map((r) => ({
+      ...r,
+      accountName: nameById[r.accountId] ?? r.accountId,
+    }))
+  );
+});
+
+// -----------------------------
+// Start
+// -----------------------------
+app.listen(PORT, () => console.log("listening on :" + PORT));
